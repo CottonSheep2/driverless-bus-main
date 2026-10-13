@@ -16,6 +16,8 @@ public class Bus {
     private String model;
     private Integer capacity;
     private Long routeId;
+    /** 电量百分比(0-100) */
+    private Integer battery;
     private Integer status;
     private String remark;
     private LocalDateTime createTime;

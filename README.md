@@ -38,11 +38,15 @@ CREATE DATABASE IF NOT EXISTS autonomous_bus DEFAULT CHARACTER SET utf8mb4;
 | `schema.sql` | 建表 + 基础角色、管理员账号 |
 | `data_extra.sql` | 测试数据（站点、线路、车辆、告警等） |
 | `log_schema.sql` | 操作日志表 |
+| `schedule_schema.sql` | 运营调度模块建表（排班表、车次表）+ 车辆电量字段 |
+| `schedule_demo.sql` | 运营调度演示数据（排班、车次样例） |
 
 ```bash
 mysql -u root -p autonomous_bus < src/main/resources/schema.sql
 mysql -u root -p autonomous_bus < src/main/resources/data_extra.sql
 mysql -u root -p autonomous_bus < src/main/resources/log_schema.sql
+mysql -u root -p autonomous_bus < src/main/resources/schedule_schema.sql
+mysql -u root -p autonomous_bus < src/main/resources/schedule_demo.sql
 ```
 
 ### 2. 修改配置
@@ -103,14 +107,23 @@ com.autonomous.bus
 │   ├── BusController.java        # 公交车管理
 │   ├── AlarmController.java      # 告警上报/处理/删除
 │   ├── AlarmTypeController.java  # 告警类型管理
-│   └── OperationLogController.java # 操作日志查询/删除
+│   ├── OperationLogController.java # 操作日志查询/删除
+│   ├── ScheduleController.java   # 排班计划管理
+│   ├── DispatchController.java   # 派车/临时调度
+│   └── TripController.java       # 车次任务管理
 ├── dto/                          # 数据传输对象
 │   ├── LoginDTO.java
 │   ├── RouteDTO.java
-│   └── AlarmHandleDTO.java
+│   ├── AlarmHandleDTO.java
+│   ├── ScheduleBatchDTO.java     # 批量排班参数
+│   └── DispatchDTO.java          # 派车/临时调度参数
 ├── entity/                       # 数据库实体
+│   ├── BusSchedule.java          # 排班计划
+│   └── TripRecord.java           # 车次记录
 ├── mapper/                       # MyBatis-Plus Mapper 接口
 ├── service/                      # 业务接口
+│   ├── ScheduleService.java      # 排班业务（含批量生成）
+│   ├── TripService.java          # 车次/派车/临时调度业务
 │   └── impl/                     # 业务实现
 │       └── TokenServiceImpl.java # Redis Token 管理
 ├── exception/
@@ -131,8 +144,20 @@ com.autonomous.bus
 ### 操作审计日志
 - 通过自定义注解 `@OperLog(module="模块名", operation="操作描述")` 标注需要记录的方法
 - AOP 切面自动记录：操作人、模块、操作类型、请求参数、IP、耗时、执行状态
-- 覆盖模块：系统管理（登录/登出）、站点管理、线路管理、公交车管理、告警管理、告警类型管理
+- 覆盖模块：系统管理（登录/登出）、站点管理、线路管理、公交车管理、告警管理、告警类型管理、排班计划管理、派车调度、临时调度、车次任务管理
 - 仅 ADMIN 可删除和清空操作日志
+
+### 运营调度模块（核心业务）
+
+- **排班计划管理**：选择线路、方向（去程/返程）设置发车时间；支持手动单条排班和批量生成（输入首班、末班、发车间隔，自动批量生成多条排班）。排班保存后状态为"待发车"。
+- **自动派车**：后端 `@Scheduled` 定时任务（每 5 秒）扫描排班表，到达发车时间且状态为"待发车"时，自动筛选空闲（待命）、归属该线路、电量充足（≥20%）的车辆完成派车：绑定车辆、新建车次、车辆状态改为运营。无空闲车辆时标记为"待派车"。
+- **手动派车**：调度员从待发车排班中挑选，手动选择空闲车辆派车，与自动派车执行相同的数据更新逻辑，并记录操作日志。
+- **临时调度**：
+  - 临时加派：突发客流时不依赖预设排班，直接临时创建车次并派车发车；
+  - 车辆下线：选中运营中车辆强制下线，停止自动行驶、车辆改待命、当前车次标记"中断"并写入原因；
+  - 线路临时停运：整条线路暂停，该线路所有待发车排班置为"已停运"；
+  - 车辆接替（应急调度）：车辆故障告警时，调度员选择备用待命车辆接替后续班次。
+- **车次任务管理**：查看所有车次（线路、车辆、发车/预计到达/实际到达、状态）；车次详情包含该趟车途经站点及到站记录；跑完一趟可手动标记完成，定时任务也会自动完成到点的车次。
 
 ## API 概览
 
@@ -163,6 +188,20 @@ Authorization: Bearer {token}
 | 操作日志 | DELETE | `/api/operation-log/{id}` | 删除日志（ADMIN） |
 | 操作日志 | DELETE | `/api/operation-log/clean` | 清空日志（ADMIN） |
 | 仪表盘 | GET | `/api/alarm/stats` | 统计数据 |
+| 排班 | GET | `/api/schedule/page` | 分页查询排班（支持按线路/方向/状态筛选） |
+| 排班 | POST | `/api/schedule/single` | 手动新增单条排班 |
+| 排班 | POST | `/api/schedule/batch` | 批量生成排班（首末班+发车间隔） |
+| 排班 | DELETE | `/api/schedule/{id}` | 删除排班 |
+| 派车 | GET | `/api/dispatch/ready-buses` | 查询空闲（待命）车辆 |
+| 派车 | POST | `/api/dispatch/manual` | 手动派车 |
+| 派车 | POST | `/api/dispatch/temp` | 临时加派班次 |
+| 派车 | POST | `/api/dispatch/offline` | 车辆强制下线 |
+| 派车 | POST | `/api/dispatch/suspend` | 线路临时停运 |
+| 派车 | POST | `/api/dispatch/replace` | 车辆接替（应急调度） |
+| 车次 | GET | `/api/trip/page` | 分页查询车次 |
+| 车次 | GET | `/api/trip/{id}` | 车次详情（含途经站点） |
+| 车次 | GET | `/api/trip/running` | 查询运行中车次 |
+| 车次 | POST | `/api/trip/complete/{id}` | 完成车次 |
 
 ### 统一响应格式
 
